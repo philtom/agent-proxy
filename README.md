@@ -1,7 +1,8 @@
 # fetch-proxy
 
-A small self-hosted web-fetching service for AI agents. Agents call `GET /fetch?url=…`
-and get back clean markdown, so they don't need to fetch sites directly.
+A small self-hosted web-fetching service for AI agents. Agents call `GET /fetch?url=…`, or the
+`fetch_page` tool on the MCP endpoint at `/mcp`, and get back clean markdown, so they don't need
+to fetch sites directly.
 
 ## How it helps with blocked fetches
 
@@ -40,10 +41,47 @@ Or with Docker: `docker build -t fetch-proxy . && docker run -p 8787:8787 -e FET
 
 Response: `{url, status, content_type, via: "http"|"browser", blocked, title, content, cached}`
 
-## Agent integration
+## MCP endpoint (Claude connectors, Cowork)
 
-`agent_tool.py` has a `fetch_page()` helper and a JSON-schema tool definition you can hand to
-Claude or another agent framework.
+The service also exposes the fetcher as an MCP server at `/mcp`, with one tool:
+`fetch_page(url, format="markdown", render="auto", wait_ms=0)`. Failed fetches, blocked sites
+and HTTP 4xx/5xx come back as tool errors, so the agent can tell and move on.
+
+- **Protocol:** MCP **2026-07-28 or newer only** (stateless Streamable HTTP, JSON responses).
+  Clients using the older `initialize` handshake (2025-11-25 and earlier) get a `-32022 Unsupported
+  protocol version` error listing the supported versions. Set `MCP_ALLOW_LEGACY=true` to also
+  accept them, for example if a client you use hasn't moved to 2026-07-28 yet.
+- **Auth:** the same `Authorization: Bearer <FETCH_PROXY_TOKEN>` header as the REST API.
+- **Stateless:** there are no sessions, so you can run several instances behind a load balancer.
+
+To add it to Claude (Cowork):
+1. Deploy behind HTTPS on port 443. Claude won't connect to a URL with a custom port.
+2. **Settings → Connectors → Add custom connector**. URL: `https://<your-host>/mcp`.
+   Under **Request headers**, add `Authorization: Bearer <your token>`.
+3. Enable the connector in Cowork. Optionally add to your instructions: "When you need to read a
+   web page, use the fetch_page tool."
+
+Test it locally with the SDK client:
+
+```python
+import asyncio, httpx2
+from mcp import Client
+from mcp.client.streamable_http import streamable_http_client
+
+async def main():
+    http = httpx2.AsyncClient(headers={"Authorization": "Bearer change-me"}, timeout=90)
+    async with Client(streamable_http_client("http://localhost:8787/mcp", http_client=http),
+                      mode="2026-07-28") as c:
+        r = await c.call_tool("fetch_page", {"url": "https://example.com"})
+        print(r.content[0].text)
+
+asyncio.run(main())
+```
+
+## Other agent integration
+
+`agent_tool.py` has a `fetch_page()` helper and a JSON-schema tool definition that call the REST
+API, for agents you run yourself.
 
 ## Configuration (environment variables)
 
@@ -58,6 +96,7 @@ Claude or another agent framework.
 | `TIMEOUT` / `MAX_BYTES` | `30` / 10 MB | Limits per request |
 | `ALLOW_PRIVATE` | `false` | Allow private/internal addresses. Leave off: this is the SSRF guard |
 | `CHROMIUM_PATH` | bundled | Use a specific Chromium binary |
+| `MCP_ALLOW_LEGACY` | `false` | Also serve MCP clients older than 2026-07-28 |
 
 ## Security notes
 

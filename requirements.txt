@@ -4,3 +4,4 @@ httpx
 trafilatura
 cachetools
 playwright
+mcp>=2.3

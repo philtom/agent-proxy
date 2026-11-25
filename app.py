@@ -7,6 +7,9 @@ Agents call  GET /fetch?url=...  instead of fetching sites directly. The service
     plain request is refused
   * returns raw HTML or clean extracted text/markdown (much cheaper for LLM context)
   * caches responses, rate-limits per host, and blocks requests to private networks
+
+The same fetcher is also exposed as an MCP server at  /mcp  (tool: fetch_page), so it
+can be added to Claude as a custom connector. It speaks MCP 2026-07-28 or newer.
 """
 
 from __future__ import annotations
@@ -18,7 +21,7 @@ import socket
 import time
 import urllib.robotparser
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -26,6 +29,11 @@ import trafilatura
 from cachetools import TTLCache
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types.jsonrpc import UNSUPPORTED_PROTOCOL_VERSION
+from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, MODERN_PROTOCOL_VERSIONS
+from pydantic import Field
 
 # ---------------------------------------------------------------- config ----
 TOKEN = os.environ.get("FETCH_PROXY_TOKEN", "")            # empty = no auth (local use only)
@@ -37,6 +45,8 @@ TIMEOUT = float(os.environ.get("TIMEOUT", "30"))
 BROWSER_CONCURRENCY = int(os.environ.get("BROWSER_CONCURRENCY", "3"))
 RESPECT_ROBOTS = os.environ.get("RESPECT_ROBOTS", "false").lower() == "true"
 ALLOW_PRIVATE = os.environ.get("ALLOW_PRIVATE", "false").lower() == "true"
+# Also accept pre-2026-07-28 MCP clients (initialize handshake). Off: only 2026-07-28+ is served.
+MCP_ALLOW_LEGACY = os.environ.get("MCP_ALLOW_LEGACY", "false").lower() == "true"
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -68,7 +78,8 @@ async def lifespan(_: FastAPI):
     )
     state["browser_sem"] = asyncio.Semaphore(BROWSER_CONCURRENCY)
     state["pw"] = state["browser"] = None
-    yield
+    async with mcp.session_manager.run():  # mounted apps' lifespans don't run on their own
+        yield
     await state["http"].aclose()
     if state["browser"]:
         await state["browser"].close()
@@ -213,20 +224,10 @@ def is_blocked(result: dict) -> bool:
     )
 
 
-# ------------------------------------------------------------------- API ----
-@app.get("/health")
-async def health():
-    return {"ok": True}
-
-
-@app.get("/fetch", dependencies=[Depends(check_auth)])
-async def fetch(
-    url: str = Query(..., description="Absolute http(s) URL"),
-    format: Literal["markdown", "text", "html"] = "markdown",
-    render: Literal["auto", "never", "always"] = "auto",
-    wait_ms: int = Query(0, ge=0, le=15000, description="Extra wait after load (browser only)"),
-    no_cache: bool = False,
-):
+# ------------------------------------------------------------ core fetch ----
+async def do_fetch(url: str, format: str = "markdown", render: str = "auto",
+                   wait_ms: int = 0, no_cache: bool = False) -> dict:
+    """Shared by the REST endpoint and the MCP tool. Raises HTTPException on failure."""
     key = (url, format, render)
     if not no_cache and key in cache:
         return {**cache[key], "cached": True}
@@ -267,4 +268,85 @@ async def fetch(
 
     if result["status"] < 400 and not out["blocked"]:
         cache[key] = out
-    return JSONResponse({**out, "cached": False}, status_code=200)
+    return {**out, "cached": False}
+
+
+# -------------------------------------------------------------- REST API ----
+@app.get("/health")
+async def health():
+    return {"ok": True, "mcp_protocol_versions": list(MODERN_PROTOCOL_VERSIONS)
+            + (list(HANDSHAKE_PROTOCOL_VERSIONS) if MCP_ALLOW_LEGACY else [])}
+
+
+@app.get("/fetch", dependencies=[Depends(check_auth)])
+async def fetch(
+    url: str = Query(..., description="Absolute http(s) URL"),
+    format: Literal["markdown", "text", "html"] = "markdown",
+    render: Literal["auto", "never", "always"] = "auto",
+    wait_ms: int = Query(0, ge=0, le=15000, description="Extra wait after load (browser only)"),
+    no_cache: bool = False,
+):
+    return await do_fetch(url, format, render, wait_ms, no_cache)
+
+
+# --------------------------------------------------------------- MCP API ----
+mcp = MCPServer(
+    name="fetch-proxy",
+    instructions="Use fetch_page to read web pages. It returns the page's main content as "
+                 "markdown and renders JavaScript-heavy pages automatically.",
+)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def fetch_page(
+    url: Annotated[str, Field(description="Absolute http(s) URL of the page to fetch")],
+    format: Annotated[Literal["markdown", "text", "html"],
+                      Field(description="markdown (default) keeps links and tables; html returns raw HTML")] = "markdown",
+    render: Annotated[Literal["auto", "never", "always"],
+                      Field(description="auto uses a headless browser only when the page needs it")] = "auto",
+    wait_ms: Annotated[int, Field(ge=0, le=15000,
+                                  description="Extra wait after load for slow JavaScript apps")] = 0,
+) -> str:
+    """Fetch a web page and return its main content. Handles JavaScript-rendered pages."""
+    try:
+        d = await do_fetch(url, format, render, wait_ms)
+    except HTTPException as e:
+        raise ToolError(f"fetch failed ({e.status_code}): {e.detail}")
+    if d["blocked"]:
+        raise ToolError(f"BLOCKED (HTTP {d['status']}): {url} refused automated access. "
+                        "Try another source for this information.")
+    if d["status"] >= 400:
+        raise ToolError(f"HTTP {d['status']} from {d['url']}: {d['content'][:500]}")
+    return f"# {d.get('title') or d['url']}\nSource: {d['url']} (HTTP {d['status']})\n\n{d['content']}"
+
+
+class MCPGate:
+    """Bearer-token check plus protocol-version floor in front of the MCP endpoint.
+
+    Requests without an MCP-Protocol-Version header, or with a pre-2026-07-28 version (which would
+    start a legacy initialize handshake), are rejected with the SDK's own error shape, so clients
+    see which versions are supported.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = dict(scope["headers"])
+        if TOKEN and headers.get(b"authorization", b"").decode("latin-1") != f"Bearer {TOKEN}":
+            return await JSONResponse({"error": "missing or bad bearer token"}, 401)(scope, receive, send)
+        pv = headers.get(b"mcp-protocol-version", b"").decode("latin-1")
+        if not MCP_ALLOW_LEGACY and (not pv or pv in HANDSHAKE_PROTOCOL_VERSIONS):
+            error = {"code": UNSUPPORTED_PROTOCOL_VERSION, "message": "Unsupported protocol version",
+                     "data": {"supported": list(MODERN_PROTOCOL_VERSIONS), "requested": pv}}
+            return await JSONResponse({"jsonrpc": "2.0", "id": None, "error": error}, 400)(scope, receive, send)
+        await self.app(scope, receive, send)
+
+
+# Stateless + JSON responses: no sessions to pin to one instance, so it scales horizontally.
+# host="0.0.0.0" skips the SDK's localhost-only DNS-rebinding guard; the bearer token protects it instead.
+app.mount("/", MCPGate(mcp.streamable_http_app(
+    streamable_http_path="/mcp", stateless_http=True, json_response=True, host="0.0.0.0",
+)))
